@@ -4,7 +4,9 @@ import requests
 from flask import Flask, request, jsonify
 import json
 import pki
-from pki import NomadWallet, craft_pem_file, breakdown_pem_file, read_public_key
+from pki import NomadWallet, craft_public_pem, breakdown_pem_file, read_public_key
+from poc import *
+import os
 
 class Transaction:
     #Builds class constructor
@@ -14,13 +16,15 @@ class Transaction:
     #amount = amount of value to be transferred
     #data = {'transaction_type':'', 'transaction data':{}}
     #signatures = {'public_key':'', 'signature':[time.now(), 'signature']
-    def __init__(self, index, source, destination, signatures, amount=0, data=None):
-        self.index = index
+    def __init__(self, source, destination, signatures, amount=0, data=None, index=None):
+        #Transaction variables
         self.source = source
         self.destination = destination
         self.amount = amount
         self.data = data
         self.signatures = signatures
+        #Block variables
+        self.index = index
 
     def __repr__(self):
         return f'''{str(type(self))[19:-2]}(index = {self.index}, source = {"'"+self.source+"'"}, destination = {"'"+self.destination+"'"}, amount = {self.amount}, data = {self.data}, signatures = {self.signatures})'''
@@ -36,9 +40,17 @@ class Transaction:
             }
         return json.dumps(transaction)
 
+    def as_dict(self):
+        return {
+            'index':self.index,
+            'source':self.source,
+            'destination':self.destination,
+            'amount':self.amount,
+            'data':self.data,
+            'signatures':self.signatures
+            }
     def content(self):
         transaction = {
-            'index':self.index,
             'source':self.source,
             'destination':self.destination,
             'amount':self.amount,
@@ -47,8 +59,9 @@ class Transaction:
         return json.dumps(transaction)
 
     def sign(self, wallet):
-        signature = wallet.sign(self.content())
-        s = {'address':wallet.string_public_key, 'timestamp':datetime.now(), 'signature':signature}
+        timestamp = str(datetime.now())
+        signature = wallet.sign(self.content()+timestamp)
+        s = {'address':wallet.string_public_key, 'timestamp':timestamp, 'signature':str(signature)}
         self.signatures.append(s)
         if self.signatures[-1] == s:
             return "Success"
@@ -56,110 +69,123 @@ class Transaction:
             return "False"
 
     def verify_signatures(self):
+        auth = []
         for signature in self.signatures:
-            #Load wallet from Public Key string
-            craft_pem_file(signature['address'],'./Keys/Public/')
+            filename = './Keys/Public/public.pem'
+            craft_public_pem(signature['address'], filename)
+            wallet = NomadWallet(public_key = read_public_key(filename))
             #Verify signature using wallet and return result
-            wallet.verify_signature(signature['signature'])
-
-
-
-
-    def verify(self,blockchain):
-        #Verifies that the source wallet has the necessary funds for the transaction
-        if blockchain.address_balance(self.source) < self.amount:
-            print("Insufficient Funds in Source Wallet")
-            return False
-
-        #
-            return False
-
-#data = ['Decrypted',{
-    #'encrypted_index':[block_index, transaction_index],
-    #'encryption_method':['Public Key Method']
-    #'encryption_key':destination of classified transaction
-    #'decrypted_transaction':original decrypted transaction data
-    #}]
-class DecryptedTransaction(Transaction):
-    #Returns decrypted transaction data in the following form: [transaction_type, transaction_data]
-    def decrypt_transaction_data(self):
-        #REPLACE#
-        return self.data[1]['decrypted_transaction']
-
-    #Returns True if transaction is valid and False if it is invalid
-    def verify(self, blockchain):
-        #Executes basic transaction.verify()
-        if super().verify():
-            #Attempts to decrypt the transaction at encrypted_index
-            decrypted_transaction_data = self.decrypt_transaction_data()
-
-            #Compares decrypted transaction to provided transaction
-            if self.data[1]['decrypted_transaction'] == decrypted_transaction_data:
-                #Initiates decrypted transaction
-                transaction = eval(self.data[1])
-                #Verifies decrypted transaction
-                if transaction.verify():
-                    return True
-                else:
-                    if self.destination == transaction.source:
-                        if self.source == transaction.destination:
-                            if self.amount == transaction.amount:
-                                return True
-                            else:
-                                print("Invalid Amount: " + str(self.amount) + "\nCorrect Amount: " + str(transaction.amount))
-                        else:
-                            print("Invalid Source Address: " + str(self.source) + "\nCorrect Source Address: " + str(transaction.source))
-                    else:
-                        print("Invalid Destination Address: " + str(self.destination) + "\nCorrect Destination Address: " + str(transaction.destination))
+            signature_status = wallet.verify_signature(signature['signature'],self.content()+str(signature['timestamp']))
+            if signature_status:
+                auth.append([signature_status,'Success'])
             else:
-                print("Transactions do not match...")
-        else:
-            return False
+                auth.append([signature_status,'Failure'])
+        return auth
+
+    def validate(self):
+        #Verify that amount is positive
+        if self.amount < 0:
+            return [False, 'Amount must be positive.']
+        #Validate signatures
+        i = 0
+        invalid=[]
+        for signature in self.signatures:
+            if self.source == signature['address']:
+                for status in self.verify_signatures():
+                    if status[0] == False:
+                        invalid.append([i,status[1]])
+                if len(invalid) != 0:
+                    return [False, str(invalid)]
+                return [True, 'Success']
+        return [False, 'Source Signature Not Present']
+
+class RDSTransaction:
+    def __init__(self, source, destination, signatures, data, amount=0, index=None):
+        if type(data) is not dict:
+            return 'Data must be in dictionary format...'
+        if 'transaction_type' not in data.keys():
+            return 'transaction_type required...'
+        if data['transaction_type'] != 'RDSTransaction':
+            return 'transaction_type must be RDSTransaction'
+        super().__init__(self, source, destination, signatures, data, amount, index)
+
+    def download(self):
+        file_id = self.data['data']['file_id']
+        url = self.data['data']['url']
+        return requests.get(url+'/shards/'+file_id).content
+
 
 class Block:
-    def __init__(self, index, miner, previous_nonce=None, current_hash=None, signature=None, timestamp=None, data=[]):
-        self.index = index
-        self.previous_nonce = previous_nonce
-        self.current_hash = current_hash
-        self.miner = miner
-        self.signature = signature
-        self.data = data
+    #Builds the Block Item Using the Parameters Below
+    def __init__(self, miner=None, source_node=None, block_index=None, proof={}, signatures=[], data=[]):
+        #Block variables
+        self.miner = miner #Miner's Public Key, Must Match Scoop Encryption
+        self.source_node = source_node #Source Node's Public Key
+        self.signatures = signatures #
+        self.data = data #Contains All Transactions Within the Block
 
+        #BlockChain variables
+        self.block_index = block_index #Represents the Block's Index Within the BlockChain
+        self.proof = proof #Proof contains nonce and scoop
+
+    #Returns a String That Can Be Executed to Create the Same Block Item
     def __repr__(self):
-        return f'Block(index={self.index}, miner={self.miner}, previous_nonce={self.previous_nonce}, current_hash={self.current_hash}, signature={self.signature}, data={self.data})'
+        return f'Block(miner="{self.miner}", source_node="{self.source_node}", signatures={self.signatures}, data={self.data}, block_index={self.block_index}, proof={self.proof})'
 
+    #Returns a Human-Readable Form of the Block Item's Contents
     def __str__(self):
-        return json.dumps({'index':self.index, 'previous_nonce':self.previous_nonce, 'current_hash':self.current_hash, 'signature':self.signature, 'data':self.data})
+        return json.dumps({'miner':self.miner, 'source_node':self.source_node, 'signatures':str(self.signatures), 'data':self.data, 'block_index':self.block_index, 'proof':self.proof})
 
-    def str_no_signatures(self):
-        return json.dumps({'index':self.index, 'previous_nonce':self.previous_nonce, 'current_hash':self.current_hash, 'data':self.data})
+    #Returns a Human-Readable Form of the Block Item's Contents
+    def as_dict(self):
+        return {
+                'miner':self.miner,
+                'source_node':self.source_node,
+                'signatures':str(self.signatures),
+                'data':self.data,
+                'block_index':self.block_index,
+                'proof':self.proof
+                }
 
-    def authenticate(self, blockchain):
-        #Pull the last block from the blockchain
-        last_block = blockchain.blocks[-1]
-        #Verify previous_hash against the last block in blockchain
-        if self.previous_hash != last_block.current_hash:
-            print("Previous Hash is incorrect.")
-            return False
+    #Returns the Block Data to be Used for Block Signatures
+    def content(self):
+        return json.dumps({'data':self.data})
 
-        #Authenticate previous_nonce against the last block in blockchain
-        #if self.previous_hash != hash_function(str(previous_nonce) + last_block_contents):
-            #print("Nonce is incorrect.")
-            #return True
+    def verify_signature_exists(self, address):
+        for signature in self.signatures:
+            if signature['adress'] == adress:
+                return [True, 'Success!']
+        return [False, 'Signature Not Present.']
 
+    def validate(self):
         #Authenticate block signature using miner's address
-
-
+        miner_status = self.verify_signature_exists(self.miner)
+        if miner_status == False:
+            return [False, 'Miner signature required...']
+        #Authenticate block signature using source node's address
+        node_status = self.verify_signature_exists(self.source_node)
+        if node_status == False:
+            return [False, 'Node signature required...']
         #Authenticate transactions in block data
-        failed_transactions = [transaction.index for transaction in self.data if transaction.authenticate(blockchain) == False]
+        failed_transactions = [transaction.index for transaction in self.data if transaction.validate() == False]
         if len(failed_transactions) > 0:
             print("The following transactions failed to authenticate.")
             for index in failed_transactions:
                 print("    "+index)
-            return False
+            return [False, 'The following transactions failed to authenticate: ' + ','.join(map(str, failed_transactions))]
 
         #If all parameters are met, return True
-        return True
+        return [True, 'Success']
+
+    def sign(self, wallet):
+        timestamp = str(datetime.now())
+        signature = wallet.sign(self.content()+timestamp)
+        s = {'address':str(wallet.string_public_key), 'timestamp':timestamp, 'signature':str(signature)}
+        self.signatures.append(s)
+        if s in self.signatures:
+            return "Success"
+        else:
+            return "False"
 
     def hash_block(self, nonce=None):
         sha = hasher.sha256()
@@ -168,59 +194,83 @@ class Block:
             sha.update(str(previous_nonce).encode('utf8'))
         self.hash = sha.hexdigest()
 
-    def check_block_nonce(self, nonce, blockchain):
-        if self.hash_block(nonce) == blockchain.blocks[-1].current_hash:
-            return True
-        else:
-            return False
 
     def add_transactions(self,transactions):
         for transaction in transactions:
             self.data.append(transaction)
 
 class Genesis_Block(Block):
-    def __init__(self,miner_wallet):
-        super().__init__(index=0, miner=breakdown_pem_file('Keys/Public/NOMAD.pem'), previous_nonce=0, timestamp=str(datetime.now()))
-        wallet = read_public_key('Keys/Public/NOMAD.pem')
-        self.add_transactions[
-                            {'type':'EntityTransaction','data':str(Transaction(source=breakdown_pem_file('Keys/Public/NOMAD.pem'), destination=breakdown_pem_file('Keys/Public/NOMAD.pem'), amount=0, data={'Name':'NOMAD'}).sign())},
-                            {},
-                            {}
-                            ]
+    def __init__(self,founder_wallet):
+        scoop = []
+        with open('./Vault/nomad.plot','rb') as plot_file:
+            lines = plot_file.readlines()
+            scoop = [hash_it(nonce) for nonce in lines[:5]]
+            nonce = lines[0].decode('utf-8')
+        super().__init__(miner=str(founder_wallet.string_public_key), source_node=str(founder_wallet.string_public_key), proof={'nonce':nonce, 'scoop':scoop})
+        #Create transactions for Genesis Block
+        NomadID = Transaction(index=[0,0], source=str(founder_wallet.string_public_key), destination=str(founder_wallet.string_public_key), amount=0, data={'Name':'NOMAD'}, signatures=[])
+        NomadID.sign(founder_wallet)
+        self.add_transactions([{'type':'EntityTransaction','data':str(NomadID)}])
+        self.sign(founder_wallet)
+        self.block_index = 0
 
 class BlockChain:
-    def __init__(self):
-        self.blockchain = []
+    def __init__(self, founder_wallet, blockchain=None):
+        self.wallet = founder_wallet
+        if blockchain != None:
+            self.blockchain = blockchain
+        elif founder_wallet != None:
+            self.blockchain = [Genesis_Block(founder_wallet).as_dict()]
         self.nodes = [] #Node Address = "127.0.0.1"
-        self.create_genesis_block()
-        self.current_block = Block(len(self.blockchain),[],json.loads(self.blockchain[len(self.blockchain)-1])['hash']) #Current Transactions
-        self.last_proof = self.blockchain[0]['proof']
+        self.current_block = Block() #Current Transactions
+        self.last_block = self.blockchain[-1]
+
+    def __str__(self):
+        chain = []
+        for block in self.blockchain:
+            chain.append(str(block))
+        return json.dumps({'blockchain':chain})
+
+    def pend_transaction(self, transaction):
+        transaction['index'][1]
+        self.current_block.add_transactions([transaction])
+        if len(self.current_block.data) > 5:
+            m = mine_by_capacity(self.last_block['proof'])
+            if m[0] == True:
+                self.current_block.proof = m[1]
+                self.current_block.block_index = len(self.blockchain)
+                self.current_block.miner = str(self.wallet.string_public_key)
+                self.current_block.source_node = str(self.wallet.string_public_key)
+                b = self.current_block.as_dict()
+                self.current_block = Block()
+                status = self.add_block(b)
+                print(status)
+                if status[0] == True:
+                    return status
+        return ['True', 'Transaction pending.']
+
+    def add_block(self, block):
+        def verify_block_against_blockchain(self, block):
+            last_proof = self.last_block['proof']
+            proof = block['proof']
+            print(proof)
+            #Validate Block's proof against last block in valid_blocks
+            if hash_it(proof['nonce']) in last_proof['scoop'] and hash_it(proof['nonce']) in proof['scoop']:
+                return [True, 'Success!']
+            return [False, 'Invalid Proof...']
+
+        verified = verify_block_against_blockchain(self, block=block)
+        if verified[0] == True:
+            block['index'] = len(self.blockchain)
+            self.blockchain.append(block)
+            self.last_block = self.blockchain[-1]
+            if len(self.current_block.data) >= 5:
+                m = mine_by_capacity(self.last_block['proof'])
+        return verified
+
 
     def add_node(self, node_url):
         self.nodes.append(node_url)
-
-    def create_genesis_block(self):
-        #Initiates genesis block
-        genesis_block = Block(0, "0")
-
-        #A list of transactions to be included in the genesis block
-        genesis_block.add_transactions([str(Transaction(index=0, source='#', destination='NETWORK', amount=25000000, signatures=[{'#':'ABCD'}]))])
-        wallet1 = NomadWallet()
-        wallet2 = NomadWallet()
-        genesis_block.add_transactions([str(Transaction(index=1, source='NETWORK', destination=wallet1.string_public_key, amount=10, signatures=[{'NETWORK':'DEFG'}]))])
-        genesis_block.add_transactions([str(Transaction(index=2, source=wallet1.string_public_key, destination=wallet2.string_public_key, amount=2, signatures=[{wallet1.string_public_key:'HIJK'}]))])
-        self.blockchain.append(str(genesis_block))
-
-    def proof_of_work(self):
-        incrementor = self.last_proof + 1
-        while not (incrementor % 9 == 0 and incrementor % self.last_proof == 0):
-            incrementor += 1
-            if incrementor % 100 == 0:
-                #Check if the current proof has already been found
-                if update_blockchain(self.nodes):
-                    incrementor = self.last_proof + 1
-                    self.current_block.previous_hash = self.blockchain[len(self.blockchain)-1].hash
-        return incrementor
 
     #Returns True if this node's current proof of work matches the networks, and False if a new proof of work needs to be started
     def update_blockchain(self):
@@ -239,14 +289,29 @@ class BlockChain:
         return update
 
     #Return True if blockchain is valid
-    def verify_blockchain(consensus_mode,blockchain):
-        incrementor = 1
-        while incrementor <= len(self.blockchain):
-            if self.blockchain[incrementor-1].proof != self.blockchain[incrementor]:
-                return False
-        return True
+    def validate(self):
+        valid_blocks = [self.blockchain[0]]
+        while len(valid_blocks) != len(self.blockchain):
+            block = self.blockchain[len(valid_blocks)]
+            if block.validate()[0] == True:
+                proof = block.proof
+                #Validate Block's proof against last block in valid_blocks
+                last_block = valid_blocks[-1]
+                last_proof = last_block.proof
+                if hash_it(proof['nonce']) not in last_proof['scoop']:
+                    return [False, 'Invalid Proof at Block: '+ str(len(valid_blocks))]
+                #If block is valid append to valid_blocks
+                valid_blocks.append(block)
+            else:
+                return [False, 'Invalid block at the following index: ' + str(len(valid_blocks))]
+        return [True, 'Successfully validated!']
 
-    #blockchain=Patchwork BlockChain,index=[BlockIndex,TransactionIndex]
+    def retrieve_block(self, index):
+        if index < len(self.blockchain):
+            return [True,str(self.blockchain[index])]
+        else:
+            return [False, 'Index out of range...']
+
     def retrieve_transaction(self,index,type=''):
         transaction = self.blockchain[index[0]]['data'][index[1]]['data']
         transaction_type = transaction[0]

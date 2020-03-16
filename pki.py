@@ -22,7 +22,9 @@ class NomadWallet:
         else:
             self.private_key = generate_private_key()
             self.public_key = self.private_key.public_key()
-        self.string_public_key = text_public_key(self.public_key).decode('utf8')[8:]
+        store_public_key(self.public_key, './Keys/Public/public.pem')
+        self.string_public_key = breakdown_pem_file('./Keys/Public/public.pem')
+        os.remove('./Keys/Public/public.pem')
 
         self.encrypted = encrypted
         if self.encrypted:
@@ -201,7 +203,7 @@ def breakdown_pem_file(file_name):
         key = key + line
     return key
 
-def craft_pem_file(key, file_name):
+def craft_public_pem(key, file_name):
     with open(file_name, 'w') as file:
         file.write('-----BEGIN PUBLIC KEY-----\n')
         index = 0
@@ -214,7 +216,22 @@ def craft_pem_file(key, file_name):
             line = line + key[index]
         file.write(line + '\n')
 
-        file.write('-----END PUBLIC KEY-----')
+        file.write('-----END PUBLIC KEY-----\n')
+
+def craft_private_pem(key, file_name):
+    with open(file_name, 'w') as file:
+        file.write('-----BEGIN PRIVATE KEY-----\n')
+        index = 0
+        line = key[index]
+        while index < len(key) - 1:
+            index = index + 1
+            if index % 64 == 0 or index == len(key):
+                file.write(line + '\n')
+                line = ''
+            line = line + key[index]
+        file.write(line + '\n')
+
+        file.write('-----END PRIVATE KEY-----\n')
 
 def shard_file(file_path, number_of_shards=3, shard_size=10, min_shard_size=1, max_shard_size=256000, dest='./'):
     with open(file_path, 'r+') as f:
